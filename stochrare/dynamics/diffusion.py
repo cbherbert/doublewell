@@ -156,7 +156,7 @@ class DiffusionProcess:
         dt = kwargs.get('dt', self.default_dt)
         dim = len(xn)
         dw = kwargs.get('dw', np.random.normal(0.0, np.sqrt(dt), dim))
-        return xn + self.drift(xn, tn)*dt+self.diffusion(xn, tn)@dw
+        return self._euler_maruyama(xn, tn, wn, dt, self.drift, self.diffusion)
 
 
     def integrate_sde(self, x, t, w, **kwargs):
@@ -255,12 +255,17 @@ class DiffusionProcess:
     @staticmethod
     @jit(nopython=True)
     def _euler_maruyama(x, t, w, dt, drift, diffusion):
-        for index in range(1, len(w)+1):
-            wn = w[index-1]
-            xn = x[index-1]
-            tn = t[index-1]
-            x[index] = xn + drift(xn, tn)*dt + np.dot(diffusion(xn, tn), wn)
-        return x
+        if w.ndim == 1:
+            # Test if w is just a vector
+            # In that case do only one EM iteration
+            return x + drift(x, t)*dt + np.dot(diffusion(x, t), w)
+        else:
+            for index in range(1, len(w)+1):
+                wn = w[index-1]
+                xn = x[index-1]
+                tn = t[index-1]
+                x[index] = xn + drift(xn, tn)*dt + np.dot(diffusion(xn, tn), wn)
+            return x
 
 
     @pseudorand
