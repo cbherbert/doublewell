@@ -228,31 +228,25 @@ class TestDynamics(unittest.TestCase):
 
 
     def test_empirical_vector(self):
-        model = diffusion.DiffusionProcess(lambda x, t: 2 * x, lambda x, t: x, 1)
+        model = diffusion.DiffusionProcess(
+            lambda x, t: 2 * x, lambda x, t: x, 1, deterministic=True
+        )
+        nsamples = 10
         x0 = 1.0
+        expected_obs = [1.0] * nsamples
         t0 = 0.0
         dt_brownian = 0.01
         dt = 0.1
-        nsamples = 1
-        brownian_paths = [
-            self.wiener1.trajectory(x0, t0, T=1, dt=dt_brownian)
-            for sample in range(nsamples)
-        ]
 
-        refererence_trajectories = [
-            model.trajectory(x0, t0, T=1, brownian_path=brownian_path, dt=dt)[1]
-            for brownian_path in brownian_paths
-        ]
         args = [0.3, 0.5, 1.0]
-        empirical_vector_gen = model.empirical_vector(
-            x0, t0, nsamples, *args, brownian_paths=brownian_paths, dt=dt
-        )
-        for i, (t, pdf, bins) in enumerate(empirical_vector_gen):
-            self.assertEqual(t, args[i])
-            index = int(t / dt) + 1
+        empirical_vector_generator = model.empirical_vector(x0, t0, nsamples, *args, dt=dt)
+        for i, (t, pdf, bins) in enumerate(empirical_vector_generator):
             expected_obs = [
-                trajectory[index - 1] for trajectory in refererence_trajectories
+                model.trajectory(expected_obs[sample], t0, T=args[i] - t0, dt=dt)[1][-1]
+                for sample in range(nsamples)
             ]
+            t0 = args[i]
+            self.assertEqual(t, args[i])
             expected_pdf, expected_bins = np.histogram(expected_obs, density=True)
             np.testing.assert_allclose(pdf, expected_pdf)
             np.testing.assert_allclose(bins, expected_bins)

@@ -482,6 +482,7 @@ class DiffusionProcess:
             yield np.average(time, axis=0), np.average(obs, axis=0)
 
 
+    @method1d
     def empirical_vector(self, x0, t0, nsamples, *args, **kwargs):
         r"""
         Empirical vector at given times.
@@ -517,31 +518,12 @@ class DiffusionProcess:
         hist_kwargs_keys = ('bins', 'range', 'weights') # hard-coded for now, we might use inspect
         hist_kwargs = {key: kwargs[key] for key in kwargs if key in hist_kwargs_keys}
         def traj_sample(x0, t0, *args, **kwargs):
-            if 'brownian_path' in kwargs:
-                tw, w = kwargs.get('brownian_path')
-                dt = kwargs.get('dt', self.default_dt)
-                offset=0
-            for i, tsample in enumerate(args):
-                if 'brownian_path' in kwargs:
-                    deltat = tw[1]-tw[0]
-                    num = int((tsample-t0)/deltat)+1
-                    brownian_path_chunk = (tw[offset:num+offset], w[offset:num+offset])
-                    offset = num + offset - 1
-                    kwargs.update({'brownian_path': brownian_path_chunk})
+            for tsample in args:
                 t, x = self.trajectory(x0, t0, T=tsample-t0, **kwargs)
                 t0 = t[-1]
                 x0 = x[-1]
                 yield tsample, x0
-
-
-        brownian_paths = kwargs.pop('brownian_paths', None)
-        traj_ensemble = []
-        for sample in range(nsamples):
-            if brownian_paths:
-                kwargs.update({'brownian_path': brownian_paths[sample]})
-            traj_ensemble.append(traj_sample(x0, t0, *args, **kwargs))
-
-        for ensemble in zip(*traj_ensemble):
+        for ensemble in zip(*[traj_sample(x0, t0, *args, **kwargs) for _ in range(nsamples)]):
             time, obs = zip(*ensemble)
             yield (time[0], ) + np.histogram(obs, density=True, **hist_kwargs)
 
