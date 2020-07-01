@@ -2,8 +2,10 @@
 Unit tests for the diffusion module.
 """
 import unittest
+import inspect
 import numpy as np
 import stochrare.dynamics.diffusion as diffusion
+import stochrare.dynamics.diffusion1d as diffusion1d
 from unittest.mock import patch
 from numba import jit
 
@@ -11,7 +13,23 @@ class TestDynamics(unittest.TestCase):
     def setUp(self):
         self.oup = diffusion.OrnsteinUhlenbeck(0, 1, 1, 2, deterministic=True)
         self.wiener = diffusion.Wiener(2, D=0.5, deterministic=True)
-        self.wiener1 = diffusion.Wiener(1, D=0.5, deterministic=True)
+        self.wiener1 = diffusion1d.Wiener1D(D=0.5, deterministic=True)
+
+
+        self.diffusions = []
+        self.diffusions.append(diffusion.DiffusionProcess(lambda x, t: 2*x,
+                                                          lambda x, t: 1,
+                                                          1,
+                                                          deterministic=True))
+        self.diffusions.append(diffusion.DiffusionProcess(lambda x, t: 2*x,
+                                                          lambda x, t: np.identity(2),
+                                                          2,
+                                                          deterministic=True))
+        self.diffusions.append(diffusion.DiffusionProcess(lambda x, t: 2*x,
+                                                          lambda x, t: np.identity(3),
+                                                          3,
+                                                          deterministic=True))
+
 
     def test_properties(self):
         self.assertEqual(self.oup.D0, 1)
@@ -35,6 +53,19 @@ class TestDynamics(unittest.TestCase):
             model = diffusion.DiffusionProcess(lambda x,t: x, lambda x,t: x, -1)
 
 
+    def test_update(self):
+        x = 0.0
+        dw = np.random.normal(1)
+        result = self.diffusions[0].update(x, 0, dw=dw)
+        np.testing.assert_equal(result, dw)
+
+        for model in self.diffusions[1:]:
+            x = np.zeros(shape=model.dimension)
+            dw = np.random.normal(size=model.dimension)
+            result = model.update(x, 0, dw=dw)
+            np.testing.assert_array_equal(result, dw)
+
+
     def test_potential(self):
         x = np.linspace(-1, 1)
         np.testing.assert_array_equal(diffusion.Wiener.potential(x), np.zeros_like(x))
@@ -44,13 +75,6 @@ class TestDynamics(unittest.TestCase):
         x = np.ones((10, 10))
         np.testing.assert_array_equal(self.wiener.potential(x), np.zeros(len(x)))
 
-    def test_update(self):
-        for wienerD in (self.wiener, self.wiener1):
-            dw = np.random.normal(size=wienerD.dimension)
-            x = np.zeros(wienerD.dimension)
-            np.testing.assert_array_equal(wienerD.update(x, 0, dw=dw), dw)
-            np.testing.assert_array_equal(diffusion.DiffusionProcess.update(wienerD, x, 0, dw=dw),
-                                          dw)
 
     @patch.object(diffusion.DiffusionProcess, "_euler_maruyama")
     def test_integrate_sde(self, mock_DiffusionProcess):
@@ -189,6 +213,103 @@ class TestDynamics(unittest.TestCase):
         np.testing.assert_allclose(x, traj, rtol=1e-5)
 
 
+    def test_trajectory_conditional(self):
+        def pred(t,x):
+            Xp = [np.dot(xi,xi) for xi in x[t>0.5]]
+            Xm = [np.dot(xi,xi) for xi in x[t<0.5]]
+            return np.mean(Xp) > np.mean(Xm)
+
+        x0 = np.array([0.,0.])
+        t, x = self.oup.trajectory_conditional(x0, 0, pred, T=1)
+
+        Xp = [np.dot(xi,xi) for xi in x[t>0.5]]
+        Xm = [np.dot(xi,xi) for xi in x[t<0.5]]
+        self.assertTrue(np.mean(Xp) > np.mean(Xm))
+
+
+    def test_empirical_vector(self):
+        model = diffusion.DiffusionProcess(lambda x, t: 2 * x, lambda x, t: x, 1)
+        x0 = 1.0
+        t0 = 0.0
+        dt_brownian = 0.01
+        dt = 0.1
+        nsamples = 1
+        brownian_paths = [
+            self.wiener1.trajectory(x0, t0, T=1, dt=dt_brownian)
+            for sample in range(nsamples)
+        ]
+
+        refererence_trajectories = [
+            model.trajectory(x0, t0, T=1, brownian_path=brownian_path, dt=dt)[1]
+            for brownian_path in brownian_paths
+        ]
+        args = [0.3, 0.5, 1.0]
+        empirical_vector_gen = model.empirical_vector(
+            x0, t0, nsamples, *args, brownian_paths=brownian_paths, dt=dt
+        )
+        for i, (t, pdf, bins) in enumerate(empirical_vector_gen):
+            self.assertEqual(t, args[i])
+            index = int(t / dt) + 1
+            expected_obs = [
+                trajectory[index - 1] for trajectory in refererence_trajectories
+            ]
+            expected_pdf, expected_bins = np.histogram(expected_obs, density=True)
+            np.testing.assert_allclose(pdf, expected_pdf)
+            np.testing.assert_allclose(bins, expected_bins)
+
+
+    def testinstantoneq(self):
+        model = diffusion.DiffusionProcess(lambda x, t: 2*x, lambda x, t: x, 1)
+
+        xvec = np.linspace(-1,1,10)
+        pvec = np.linspace(-1,1,10)
+
+        instantoneq = np.array([model.instantoneq(0, [x,p]) for x,p in zip(xvec, pvec)])
+        # instantoneq =  [[-3.          3.        ]
+        #                 [-2.0260631   2.0260631 ]
+        #                 [-1.28257888  1.28257888]
+        #                 [-0.7037037   0.7037037 ]
+        #                 [-0.22359396  0.22359396]
+        #                 [ 0.22359396 -0.22359396]
+        #                 [ 0.7037037  -0.7037037 ]
+        #                 [ 1.28257888 -1.28257888]
+        #                 [ 2.0260631  -2.0260631 ]
+        #                 [ 3.         -3.        ]]
+
+        expected_xdot = (lambda x,p: x*x*p + 2*x)(xvec,pvec)
+        expected_pdot = (lambda x,p: -x*p*p - 2*p)(xvec,pvec)
+        np.testing.assert_allclose(instantoneq[:,0], expected_xdot)
+        np.testing.assert_allclose(instantoneq[:,1], expected_pdot)
+
+
+    def testinstantoneq_jac(self):
+        model = diffusion.DiffusionProcess(lambda x, t: 2 * x, lambda x, t: x, 1)
+
+        xvec = np.linspace(-1, 1, 10)
+        pvec = np.linspace(-1, 1, 10)
+
+        instantoneq_jac = [model.instantoneq_jac(0, [x, p]) for x, p in zip(xvec, pvec)]
+
+        expected_J11 = lambda x, p: 2 * x * p + 2
+        expected_J12 = lambda x, p: x * x
+        expected_J21 = lambda x, p: -p * p
+        expected_J22 = lambda x, p: -2 * x * p - 2
+
+        expected = [
+            [
+                [expected_J11(x, p), expected_J12(x, p)],
+                [expected_J21(x, p), expected_J22(x, p)],
+            ]
+            for x, p in zip(xvec, pvec)
+        ]
+        np.testing.assert_allclose(instantoneq_jac, expected, atol=1e-5)
+
+
+    @unittest.skip("Method not yet implemented")
+    def test_fpthsol(self):
+        raise NotImplementedError
+
+
     def test_euler_maruyama(self):
         # Test DiffusionProcess._euler_maruyama in dimension 3
         x = diffusion.DiffusionProcess._euler_maruyama_multidim(
@@ -214,6 +335,32 @@ class TestDynamics(unittest.TestCase):
             jit(lambda x, t: x + t, nopython=True),
         )
         np.testing.assert_allclose(x, np.array([1, 2.2, 9.04, 21.888]))
+
+    def test_milstein(self):
+        model = diffusion.DiffusionProcess(lambda x, t: 2*x, lambda x, t: x + t, 1)
+        x0 = 1.
+        x = model._milstein(
+            np.full((4,), x0),
+            np.array(range(3)),
+            np.array([1.,2.,1.]),
+            0.1,
+            )
+        np.testing.assert_allclose(x, [1., 2.65, 17.5975, 49.53337501])
+
+
+class TestOrnsteinUlhenbeckProcess(unittest.TestCase):
+    def setUp(self):
+        self.oup = diffusion.OrnsteinUhlenbeck(0, 1, 1, 2, deterministic=True)
+        self.wiener = diffusion.Wiener(2, D=0.5, deterministic=True)
+        self.wiener1 = diffusion.Wiener(1, D=0.5, deterministic=True)
+
+
+    def test_update(self):
+        for wienerD in (self.wiener, self.wiener1):
+            dw = np.random.normal(size=wienerD.dimension)
+            x = np.zeros(wienerD.dimension)
+            np.testing.assert_array_equal(wienerD.update(x, 0, dw=dw), dw)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -32,8 +32,9 @@ These classes form a hierarchy deriving from the base class, `DiffusionProcess`.
 import numpy as np
 import scipy.integrate as integrate
 from scipy.interpolate import interp1d
+from scipy.misc import derivative
 from numba import jit
-from ..utils import pseudorand
+from ..utils import pseudorand, method1d
 
 class DiffusionProcess:
     r"""
@@ -97,6 +98,7 @@ class DiffusionProcess:
         self._dimension = dimensionnew
 
 
+    @method1d
     def potential(self, X, t):
         """
         Compute the potential from which the force derives.
@@ -121,6 +123,7 @@ class DiffusionProcess:
             raise ValueError('Generic dynamics in arbitrary dimensions are not gradient dynamics!')
         fun = interp1d(X, -1*self.drift(X, t), fill_value='extrapolate')
         return np.array([integrate.quad(fun, 0.0, x)[0] for x in X])
+
 
     def update(self, xn, tn, **kwargs):
         r"""
@@ -166,9 +169,13 @@ class DiffusionProcess:
            "Numerical solution of stochastic differential equations", Springer (1992).
         """
         dt = kwargs.get('dt', self.default_dt)
-        dim = len(xn)
-        dw = kwargs.get('dw', np.random.normal(0.0, np.sqrt(dt), dim))
-        return xn + self.drift(xn, tn)*dt+self.diffusion(xn, tn)@dw
+        dim = self.dimension
+        if dim > 1:
+            dw = kwargs.get('dw', np.random.normal(0.0, np.sqrt(dt), dim))
+            return xn + self.drift(xn, tn)*dt+self.diffusion(xn, tn) @ dw
+        else:
+            dw = kwargs.get('dw', np.random.normal(0.0, np.sqrt(dt)))
+            return xn + self.drift(xn, tn)*dt+self.diffusion(xn, tn) * dw
 
 
     def _integrate_brownian_path(self, dw, num, ratio):
@@ -244,6 +251,8 @@ class DiffusionProcess:
         dt = kwargs.get('dt', self.default_dt)
         if method in ('euler', 'euler-maruyama', 'em'):
             x = self._euler_maruyama(x, t, w, dt)
+        elif method == 'milstein':
+            x = self._milstein(x, t, w, dt)
         else:
             raise NotImplementedError('SDE integration error: Numerical scheme not implemented')
         return x
@@ -345,6 +354,18 @@ class DiffusionProcess:
         return x
 
 
+    @method1d
+    def _milstein(self, x, t, w, dt):
+        for index, wn in enumerate(w):
+            xn = x[index]
+            tn = t[index]
+            a = self.drift(xn, tn)
+            b = self.diffusion(xn, tn)
+            db = derivative(self.diffusion, xn, dx=1e-6, args=(tn,))
+            x[index+1] = xn + (a-0.5*b*db)*dt + b*wn + 0.5*b*db*wn**2
+        return x
+
+
     @pseudorand
     def trajectory_generator(self, x0, t0, nsteps, **kwargs):
         r"""
@@ -385,6 +406,44 @@ class DiffusionProcess:
             x = self.update(x, t, dt=dt)
             yield t, obs(x, t)
 
+
+    def trajectory_conditional(self, x0, t0, pred, **kwargs):
+        r"""
+        Compute sample path satisfying arbitrary condition.
+
+        Parameters
+        ----------
+        x0: float
+            The initial position.
+        t0: float
+            The initial time.
+        pred: function with two arguments
+            The predicate to select trajectories.
+
+        Keyword Arguments
+        -----------------
+        dt: float
+            The time step, forwarded to the :meth:`update` routine
+            (default 0.1, unless overridden by a subclass).
+        T: float
+            The time duration of the trajectory (default 10).
+        finite: bool
+            Filter finite values before returning trajectory (default False).
+
+        Returns
+        -------
+        t, x: ndarray, ndarray
+            Time-discrete sample path for the stochastic process with initial conditions (t0, x0).
+            The array t contains the time discretization and x the value of the sample path
+            at these instants.
+        """
+        while True:
+            t, x = self.trajectory(x0, t0, **kwargs)
+            if pred(t, x):
+                break
+        return t, x
+
+
     def sample_mean(self, x0, t0, nsteps, nsamples, **kwargs):
         r"""
         Compute the sample mean of a time dependent observable, conditioned on initial conditions.
@@ -421,6 +480,195 @@ class DiffusionProcess:
                               for _ in range(nsamples)]):
             time, obs = zip(*ensemble)
             yield np.average(time, axis=0), np.average(obs, axis=0)
+
+
+    def empirical_vector(self, x0, t0, nsamples, *args, **kwargs):
+        r"""
+        Empirical vector at given times.
+
+        Parameters
+        ----------
+        x0 : float
+            Initial position.
+        t0 : float
+            Initial time.
+        nsamples : int
+            The size of the ensemble.
+        *args : variable length argument list
+            The times at which we want to estimate the empirical vector.
+
+        Keyword Arguments
+        -----------------
+        **kwargs :
+            Keyword arguments forwarded to :meth:`trajectory` and to :meth:`numpy.histogram`.
+
+        Yields
+        ------
+        t, pdf, bins : float, ndarray, ndarray
+            The time and histogram of the stochastic process at that time.
+
+        Notes
+        -----
+        This method computes the empirical vector, or in other words, the relative frequency of the
+        stochastic process at different times, conditioned on the initial condition.
+        At each time, the empirical vector is a random vector.
+        It is an estimator of the transition probability :math:`p(x, t | x_0, t_0)`.
+        """
+        hist_kwargs_keys = ('bins', 'range', 'weights') # hard-coded for now, we might use inspect
+        hist_kwargs = {key: kwargs[key] for key in kwargs if key in hist_kwargs_keys}
+        def traj_sample(x0, t0, *args, **kwargs):
+            if 'brownian_path' in kwargs:
+                tw, w = kwargs.get('brownian_path')
+                dt = kwargs.get('dt', self.default_dt)
+                offset=0
+            for i, tsample in enumerate(args):
+                if 'brownian_path' in kwargs:
+                    deltat = tw[1]-tw[0]
+                    num = int((tsample-t0)/deltat)+1
+                    brownian_path_chunk = (tw[offset:num+offset], w[offset:num+offset])
+                    offset = num + offset - 1
+                    kwargs.update({'brownian_path': brownian_path_chunk})
+                t, x = self.trajectory(x0, t0, T=tsample-t0, **kwargs)
+                t0 = t[-1]
+                x0 = x[-1]
+                yield tsample, x0
+
+
+        brownian_paths = kwargs.pop('brownian_paths', None)
+        traj_ensemble = []
+        for sample in range(nsamples):
+            if brownian_paths:
+                kwargs.update({'brownian_path': brownian_paths[sample]})
+            traj_ensemble.append(traj_sample(x0, t0, *args, **kwargs))
+
+        for ensemble in zip(*traj_ensemble):
+            time, obs = zip(*ensemble)
+            yield (time[0], ) + np.histogram(obs, density=True, **hist_kwargs)
+
+
+    @method1d
+    def instantoneq(self, t, Y):
+        r"""
+        Equations of motion for instanton dynamics.
+
+        Parameters
+        ----------
+        t: float
+            The time.
+        Y: ndarray or list
+            Vector with two elements: x=Y[0] the position and p=Y[1] the impulsion.
+
+        Returns
+        -------
+        xdot, pdot: ndarray (size 2)
+            The right hand side of the Hamilton equations.
+
+        Notes
+        -----
+        These are the Hamilton equations corresponding to the following action:
+        :math:`A=1/2 \int ((\dot{x}-b(x, t))/sigma(x, t))^2 dt`, i.e.
+        :math:`\dot{x}=\sigma(x,t)^2*p+b(x, t)` and
+        :math:`\dot{p}=-\sigma(x, t)*\sigma'(x, t)*p^2-b'(x, t)*p`.
+
+        The Hamiltonian is :math:`H=\sigma^2(x, t)*p^2/2+b(x, t)*p`.
+
+        Note that these equations include the diffusion coefficient, unlike those we use in the case
+        of a constant diffusion process `ConstantDiffusionProcess1D`.
+        Hence, for constant diffusion coefficients, the two only coincide when D=1.
+        Otherwise, it amounts at a rescaling of the impulsion.
+        """
+        x = Y[0]
+        p = Y[1]
+        dbdx = derivative(self.drift, x, dx=1e-6, args=(t, ))
+        dsigmadx = derivative(self.diffusion, x, dx=1e-6, args=(t, ))
+        return np.array([p*self.diffusion(x, t)**2+self.drift(x, t),
+                         -p**2*self.diffusion(x, t)*dsigmadx-p*dbdx])
+
+
+    @method1d
+    def instantoneq_jac(self, t, Y):
+        r"""
+        Jacobian of the equations of motion for instanton dynamics.
+
+        Parameters
+        ----------
+        t: float
+            The time.
+        Y: ndarray or list
+            Vector with two elements: x=Y[0] the position and p=Y[1] the impulsion.
+
+        Returns
+        -------
+        xdot, pdot: ndarray (shape (2, 2))
+            The Jacobian of the right hand side of the Hamilton equations, i.e.
+            :math:`[[d\dot{x}/dx, d\dot{x}/dp], [d\dot{p}/dx, d\dot{p}/dp]]`.
+
+        Notes
+        -----
+        These are the Hamilton equations corresponding to the following action:
+        :math:`A=1/2 \int ((\dot{x}-b(x, t))/sigma(x, t))^2 dt`, i.e.
+        :math:`\dot{x}=\sigma(x,t)^2*p+b(x, t)` and
+        :math:`\dot{p}=-\sigma(x, t)*\sigma'(x, t)*p^2-b'(x, t)*p`.
+
+        The Hamiltonian is :math:`H=\sigma^2(x, t)*p^2/2+b(x, t)*p`.
+
+        Note that these equations include the diffusion coefficient, unlike those we use in the case
+        of a constant diffusion process `ConstantDiffusionProcess1D`.
+        Hence, for constant diffusion coefficients, the two only coincide when D=1.
+        Otherwise, it amounts at a rescaling of the impulsion.
+        """
+        x = Y[0]
+        p = Y[1]
+        dbdx = derivative(self.drift, x, dx=1e-6, args=(t, ))
+        d2bdx2 = derivative(self.drift, x, n=2, dx=1e-5, args=(t, ))
+        sigma = self.diffusion(x, t)
+        dsigmadx = derivative(self.diffusion, x, dx=1e-6, args=(t, ))
+        d2sigmadx2 = derivative(self.diffusion, x, n=2, dx=1e-5, args=(t, ))
+        return np.array([[dbdx+2*p*sigma*dsigmadx, sigma**2],
+                         [-p*d2bdx2-p**2*(dsigmadx**2+sigma*d2sigmadx2), -dbdx-2*p*sigma*dsigmadx]])
+
+
+    @method1d
+    def _fpthsol(self, X, t, **kwargs):
+        """ Analytic solution of the Fokker-Planck equation, when it is known.
+        In general this is an empty method but subclasses corresponding to stochastic processes
+        for which theoretical results exists should override it."""
+        return NotImplemented
+
+
+    @method1d
+    @classmethod
+    def trajectoryplot(cls, *args, **kwargs):
+        """
+        Plot 1D  trajectories.
+
+        Parameters
+        ----------
+        *args : variable length argument list
+        trajs: tuple (t, x)
+
+        Keyword Arguments
+        -----------------
+        fig : matplotlig.figure.Figure
+            Figure object to use for the plot. Create one if not provided.
+        ax : matplotlig.axes.Axes
+            Axes object to use for the plot. Create one if not provided.
+        **kwargs :
+            Other keyword arguments forwarded to matplotlib.pyplot.axes.
+
+        Returns
+        -------
+        fig, ax: matplotlib.figure.Figure, matplotlib.axes.Axes
+            The figure.
+
+        Notes
+        -----
+        This is just an interface to the function :meth:`stochrare.io.plot.trajectory_plot1d`.
+        However, it may be overwritten in subclasses to systematically include elements to
+        the plot which are specific to the stochastic process.
+        """
+        return plot.trajectory_plot1d(*args, **kwargs)
+
 
 class ConstantDiffusionProcess(DiffusionProcess):
     r"""
